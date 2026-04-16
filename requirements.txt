@@ -8,3 +8,4 @@ pypdf
 sentence-transformers
 fastapi
 uvicorn[standard]
+httpx

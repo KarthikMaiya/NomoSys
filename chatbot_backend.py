@@ -137,10 +137,18 @@ def build_legal_chain():
     model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
     num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 
+    # For remote Ollama (e.g., when UI runs on Streamlit Cloud), set one of:
+    # - OLLAMA_BASE_URL=http://<server>:11434
+    # - OLLAMA_HOST=http://<server>:11434
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST")
+    ollama_kwargs = {}
+    if ollama_base_url:
+        ollama_kwargs["base_url"] = ollama_base_url
+
     if ChatOllama is not None:
-        llm = ChatOllama(model=model, num_ctx=num_ctx)
+        llm = ChatOllama(model=model, num_ctx=num_ctx, **ollama_kwargs)
     else:
-        llm = Ollama(model=model, num_ctx=num_ctx)
+        llm = Ollama(model=model, num_ctx=num_ctx, **ollama_kwargs)
 
     # If you have enough VRAM, you can try: llm = Ollama(model="llama3:instruct", num_ctx=2048)
 
