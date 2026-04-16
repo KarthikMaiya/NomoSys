@@ -1,4 +1,5 @@
 import os
+import threading
 from typing import List, Tuple
 
 from fastapi import FastAPI, HTTPException
@@ -38,10 +39,13 @@ if _cors_origins:
     )
 
 
+_qa_chain_lock = threading.Lock()
+
+
 @app.on_event("startup")
 def _startup() -> None:
-    # Build once and reuse across requests.
-    app.state.qa_chain = build_legal_chain()
+    # Lazy-load on first request so the service can start quickly on hosts like Render.
+    app.state.qa_chain = None
 
 
 class ChatRequest(BaseModel):
@@ -63,14 +67,21 @@ class ChatResponse(BaseModel):
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "model_ready": getattr(app.state, "qa_chain", None) is not None}
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     qa_chain = getattr(app.state, "qa_chain", None)
     if qa_chain is None:
-        raise HTTPException(status_code=503, detail="Model is not ready")
+        with _qa_chain_lock:
+            qa_chain = getattr(app.state, "qa_chain", None)
+            if qa_chain is None:
+                try:
+                    qa_chain = build_legal_chain()
+                    app.state.qa_chain = qa_chain
+                except Exception:
+                    raise HTTPException(status_code=503, detail="Model failed to initialize")
 
     try:
         result = qa_chain.invoke({"question": req.question, "chat_history": req.history})

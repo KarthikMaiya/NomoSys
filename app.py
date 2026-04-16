@@ -28,7 +28,8 @@ def call_backend_api(question: str, history: list[tuple[str, str]]) -> str:
         raise RuntimeError("NOMOSYS_API_URL is not set")
 
     url = f"{API_BASE_URL.rstrip('/')}/chat"
-    with httpx.Client(timeout=60.0) as client:
+    timeout = httpx.Timeout(300.0, connect=10.0)
+    with httpx.Client(timeout=timeout) as client:
         resp = client.post(
             url,
             json={"question": question, "history": history, "translate": True},
@@ -55,11 +56,18 @@ if query:
         st.session_state.history.append((query, answer))
         st.write("**NomoSys:**", answer)
     except Exception as e:
-        st.error(
-            "Backend is unreachable. If you're hosting on Streamlit Cloud, you must run the LLM backend elsewhere "
-            "and set the environment variable NOMOSYS_API_URL to your FastAPI server URL.\n\n"
-            f"Details: {type(e).__name__}: {e}"
-        )
+        if API_BASE_URL:
+            prefix = (
+                f"Backend API is unreachable: {API_BASE_URL}. "
+                "If you're using Render free tier, the service may be sleeping; retry after it wakes up.\n\n"
+            )
+        else:
+            prefix = (
+                "LLM backend is not configured for Streamlit Cloud. Set NOMOSYS_API_URL to your FastAPI server URL, "
+                "or set LLM_PROVIDER=openai and OPENAI_API_KEY to run without a separate backend.\n\n"
+            )
+
+        st.error(f"{prefix}Details: {type(e).__name__}: {e}")
 
 # Display chat history
 if st.session_state.history:
