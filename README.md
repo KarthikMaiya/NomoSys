@@ -150,7 +150,7 @@ streamlit run app.py
 
 ## 👨‍💻 Contributors
 
-* Jayaraj Belamagi
+* Karthik Maiya
 
 ---
 
