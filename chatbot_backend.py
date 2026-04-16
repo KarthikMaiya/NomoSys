@@ -9,6 +9,12 @@ try:
 except Exception:  # pragma: no cover
     ChatOllama = None
 
+try:
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+except Exception:  # pragma: no cover
+    ChatOpenAI = None
+    OpenAIEmbeddings = None
+
 from langchain_community.llms import Ollama  # fallback (older LangChain)
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 try:
@@ -101,11 +107,21 @@ def build_legal_chain():
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     texts = splitter.split_documents(documents)
 
-    print("📚 Creating multilingual embeddings...")
-    # ✅ Use multilingual embeddings for Hindi, Telugu, etc.
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    )
+    llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+
+    print("📚 Creating embeddings...")
+    if llm_provider == "openai":
+        if OpenAIEmbeddings is None:
+            raise ImportError("LLM_PROVIDER=openai requires 'langchain-openai' to be installed")
+
+        embeddings = OpenAIEmbeddings(
+            model=os.getenv("OPENAI_EMBEDDINGS_MODEL", "text-embedding-3-small")
+        )
+    else:
+        # ✅ Use multilingual embeddings for Hindi, Telugu, etc.
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        )
 
     # Cache the vector index locally to avoid re-embedding on every restart.
     # NOTE: Loading a saved FAISS index may require deserializing a pickle file.
@@ -130,25 +146,36 @@ def build_legal_chain():
 
     retriever = db.as_retriever(search_kwargs={"k": 5})
 
-    # ✅ Ollama model (keep it lightweight by default)
-    # IMPORTANT: default to a general chat/instruct model (not a coding model),
-    # otherwise answers may sound like a programming assistant.
-    # Override with env var: set OLLAMA_MODEL=llama3.2:3b (or similar)
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+    if llm_provider == "openai":
+        if ChatOpenAI is None:
+            raise ImportError("LLM_PROVIDER=openai requires 'langchain-openai' to be installed")
 
-    # For remote Ollama (e.g., when UI runs on Streamlit Cloud), set one of:
-    # - OLLAMA_BASE_URL=http://<server>:11434
-    # - OLLAMA_HOST=http://<server>:11434
-    ollama_base_url = os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST")
-    ollama_kwargs = {}
-    if ollama_base_url:
-        ollama_kwargs["base_url"] = ollama_base_url
-
-    if ChatOllama is not None:
-        llm = ChatOllama(model=model, num_ctx=num_ctx, **ollama_kwargs)
+        llm = ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0")),
+            timeout=float(os.getenv("OPENAI_TIMEOUT", "60")),
+            max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "2")),
+        )
     else:
-        llm = Ollama(model=model, num_ctx=num_ctx, **ollama_kwargs)
+        # ✅ Ollama model (keep it lightweight by default)
+        # IMPORTANT: default to a general chat/instruct model (not a coding model),
+        # otherwise answers may sound like a programming assistant.
+        # Override with env var: set OLLAMA_MODEL=llama3.2:3b (or similar)
+        model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+        num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+
+        # For remote Ollama (e.g., when UI runs on Streamlit Cloud), set one of:
+        # - OLLAMA_BASE_URL=http://<server>:11434
+        # - OLLAMA_HOST=http://<server>:11434
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST")
+        ollama_kwargs = {}
+        if ollama_base_url:
+            ollama_kwargs["base_url"] = ollama_base_url
+
+        if ChatOllama is not None:
+            llm = ChatOllama(model=model, num_ctx=num_ctx, **ollama_kwargs)
+        else:
+            llm = Ollama(model=model, num_ctx=num_ctx, **ollama_kwargs)
 
     # If you have enough VRAM, you can try: llm = Ollama(model="llama3:instruct", num_ctx=2048)
 
