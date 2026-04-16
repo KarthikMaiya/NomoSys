@@ -108,9 +108,13 @@ def build_legal_chain():
     )
 
     # Cache the vector index locally to avoid re-embedding on every restart.
+    # NOTE: Loading a saved FAISS index may require deserializing a pickle file.
+    # For safety, this is disabled by default for hosted APIs.
     index_dir = (Path(__file__).resolve().parent / ".faiss_index").resolve()
+    allow_pickle_load = os.getenv("FAISS_ALLOW_DANGEROUS_DESERIALIZATION", "0") == "1"
+
     try:
-        if index_dir.exists():
+        if index_dir.exists() and allow_pickle_load:
             db = FAISS.load_local(
                 str(index_dir),
                 embeddings,
@@ -123,6 +127,7 @@ def build_legal_chain():
         # If the cache is corrupted or incompatible, rebuild it.
         db = FAISS.from_documents(texts, embeddings)
         db.save_local(str(index_dir))
+
     retriever = db.as_retriever(search_kwargs={"k": 5})
 
     # ✅ Ollama model (keep it lightweight by default)

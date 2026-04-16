@@ -6,3 +6,5 @@ streamlit
 ollama
 pypdf
 sentence-transformers
+fastapi
+uvicorn[standard]
