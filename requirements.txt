@@ -10,3 +10,4 @@ sentence-transformers
 fastapi
 uvicorn[standard]
 httpx
+deep-translator
