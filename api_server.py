@@ -1,30 +1,33 @@
+import io
 import os
+import base64
 import threading
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from chatbot_backend import build_legal_chain, detect_output_language, translate_answer
+from chatbot_backend import (
+    build_legal_chain,
+    detect_output_language,
+    translate_answer,
+    analyze_case_document,
+    build_combined_chain,
+)
 
-app = FastAPI(title="NomoSys API", version="1.0.0")
+app = FastAPI(title="NomoSys API", version="2.0.0")
 
 
 def _parse_cors_origins() -> tuple[list[str], bool]:
     origins_env = os.getenv("CORS_ALLOW_ORIGINS")
     if origins_env is None:
-        # Safe-by-default for local development; override in production.
         return ["http://localhost:3000", "http://localhost:5173"], True
-
     origins = [o.strip() for o in origins_env.split(",") if o.strip()]
     if not origins:
         return [], True
-
     if "*" in origins:
-        # With wildcard origins, credentials must be disabled.
         return ["*"], False
-
     return origins, True
 
 
@@ -44,8 +47,9 @@ _qa_chain_lock = threading.Lock()
 
 @app.on_event("startup")
 def _startup() -> None:
-    # Lazy-load on first request so the service can start quickly on hosts like Render.
     app.state.qa_chain = None
+    app.state.case_db = None
+    app.state.case_summary = None
 
 
 class ChatRequest(BaseModel):
@@ -58,16 +62,80 @@ class ChatRequest(BaseModel):
         default=True,
         description="If true, detects 'in Hindi/Telugu/...' in the question and translates the answer.",
     )
+    file_name: Optional[str] = Field(
+        default=None,
+        description="Name of uploaded case file (for type detection)",
+    )
+    file_content: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded file content for inline upload",
+    )
 
 
 class ChatResponse(BaseModel):
     answer: str
     target_lang: str
+    case_summary: Optional[str] = Field(
+        default=None,
+        description="Case summary if a document was analyzed",
+    )
+
+
+class UploadResponse(BaseModel):
+    summary: str
+    status: str = "ok"
+    chunks: int = Field(description="Number of document chunks created")
 
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"status": "ok", "model_ready": getattr(app.state, "qa_chain", None) is not None}
+    return {
+        "status": "ok",
+        "model_ready": getattr(app.state, "qa_chain", None) is not None,
+        "case_loaded": getattr(app.state, "case_db", None) is not None,
+    }
+
+
+@app.post("/upload", response_model=UploadResponse)
+def upload_case(file: UploadFile = File(...)):
+    """Upload a case document (PDF/TXT) for analysis. Returns a structured case summary."""
+    content = file.file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    try:
+        file_obj = io.BytesIO(content)
+        file_obj.name = file.filename or "document.pdf"
+        case_db, summary = analyze_case_document(file_obj)
+        with _qa_chain_lock:
+            app.state.case_db = case_db
+            app.state.case_summary = summary
+        return UploadResponse(
+            summary=summary,
+            chunks=case_db.index.ntotal,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+
+
+@app.delete("/case")
+def clear_case():
+    """Clear the uploaded case document and its FAISS index."""
+    with _qa_chain_lock:
+        app.state.case_db = None
+        app.state.case_summary = None
+    return {"status": "cleared"}
+
+
+@app.get("/case")
+def get_case_status():
+    """Check if a case document is currently loaded."""
+    has_case = getattr(app.state, "case_db", None) is not None
+    return {
+        "has_case": has_case,
+        "summary": getattr(app.state, "case_summary", None) if has_case else None,
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -84,7 +152,30 @@ def chat(req: ChatRequest) -> ChatResponse:
                     raise HTTPException(status_code=503, detail="Model failed to initialize")
 
     try:
-        result = qa_chain.invoke({"question": req.question, "chat_history": req.history})
+        # Handle inline file upload
+        if req.file_content:
+            try:
+                file_bytes = base64.b64decode(req.file_content)
+                file_obj = io.BytesIO(file_bytes)
+                file_obj.name = req.file_name or "document.pdf"
+                case_db, case_summary = analyze_case_document(file_obj)
+                with _qa_chain_lock:
+                    app.state.case_db = case_db
+                    app.state.case_summary = case_summary
+            except Exception:
+                raise HTTPException(status_code=400, detail="Failed to process inline file")
+
+        # Use combined chain if case document is loaded
+        case_db = getattr(app.state, "case_db", None)
+        if case_db is not None:
+            try:
+                chain = build_combined_chain(case_db)
+                result = chain.invoke({"question": req.question, "chat_history": req.history})
+            except Exception:
+                raise HTTPException(status_code=500, detail="Combined chain error")
+        else:
+            result = qa_chain.invoke({"question": req.question, "chat_history": req.history})
+
         answer = result.get("answer", "")
 
         target_lang = "en"
@@ -93,9 +184,12 @@ def chat(req: ChatRequest) -> ChatResponse:
             if target_lang != "en":
                 answer = translate_answer(answer, target_lang)
 
-        return ChatResponse(answer=answer, target_lang=target_lang)
+        return ChatResponse(
+            answer=answer,
+            target_lang=target_lang,
+            case_summary=getattr(app.state, "case_summary", None),
+        )
     except HTTPException:
         raise
     except Exception:
-        # Avoid leaking internals.
         raise HTTPException(status_code=500, detail="Internal server error")

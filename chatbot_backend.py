@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import os
 import re
+import tempfile
 from pathlib import Path
 
 try:
@@ -34,7 +36,53 @@ try:
 except Exception:  # pragma: no cover
     from langchain.chains import ConversationalRetrievalChain
 
-# 🧩 Detect output language from query (like “in Hindi” or “in Telugu”)
+from langchain.retrievers import EnsembleRetriever
+
+
+# ─── Prompt Templates for Case Document Analysis ───────────────────────────
+
+CASE_ANALYSIS_PROMPT = PromptTemplate(
+    input_variables=["text"],
+    template=(
+        "You are a legal case analyst specializing in Indian law. "
+        "Given the following legal document text, extract and list the following details:\n"
+        "- **Parties Involved**: Names and roles (plaintiff, defendant, petitioner, respondent, etc.)\n"
+        "- **Key Facts & Timeline**: Important events in chronological order\n"
+        "- **Legal Issues / Charges**: Laws invoked, sections cited, or legal questions raised\n"
+        "- **Evidence Mentioned**: Documents, witnesses, or exhibits referenced\n"
+        "- **Relief Sought / Outcome**: What was asked for or decided\n\n"
+        "Document Text:\n{text}\n\n"
+        "Provide the extracted details as a well-structured bullet list. "
+        "If any category has no information, state 'Not mentioned in the document.'"
+    )
+)
+
+COMBINED_QA_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are an advanced legal assistant specializing exclusively in Indian law. "
+        "You have access to two sources of information:\n"
+        "1. **Case Document Context**: Excerpts from a user-uploaded legal document (FIR, judgment, contract, etc.)\n"
+        "2. **Legal Knowledge Context**: Relevant provisions from Indian statutes (Constitution, BNS, CrPC, etc.)\n\n"
+        "Both sources are combined in the context below.\n\n"
+        "Instructions:\n"
+        "1️⃣ Use the provided context to answer the question factually and accurately.\n"
+        "2️⃣ When the context contains case-specific facts (parties, dates, events), reference them directly.\n"
+        "3️⃣ When the context contains legal provisions, cite the specific article, section, or act by name.\n"
+        "4️⃣ If the question relates to an uploaded case document, connect the case facts to the relevant law.\n"
+        "5️⃣ Prefer Bharatiya Nyaya Sanhita, 2023 (BNS) references over IPC where applicable.\n"
+        "6️⃣ If the answer cannot be determined from the provided context, explicitly state: "
+        "'The provided context does not contain sufficient information to answer this question confidently.'\n"
+        "7️⃣ Do NOT invent or hallucinate any law, section number, or case fact not present in the context.\n"
+        "8️⃣ Be precise, lawful, and formal.\n\n"
+        "Context:\n{context}\n\n"
+        "Question:\n{question}\n\n"
+        "Provide a detailed, well-reasoned answer grounded strictly in the context above."
+    )
+)
+
+
+# 🧩 Detect output language from query (like "in Hindi" or "in Telugu")
 def detect_output_language(query):
     match = re.search(r"in (\w+)", query, re.IGNORECASE)
     if match:
@@ -69,6 +117,47 @@ def translate_answer(answer, target_lang="en"):
     except Exception as e:
         print("⚠️ Translation error:", e)
         return answer
+
+
+# ─── Helper: Get Embeddings ───────────────────────────────────────────────
+
+def _get_embeddings():
+    """Return the embedding model instance based on the configured provider."""
+    llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    if llm_provider == "openai":
+        if OpenAIEmbeddings is None:
+            raise ImportError("LLM_PROVIDER=openai requires 'langchain-openai' to be installed")
+        return OpenAIEmbeddings(
+            model=os.getenv("OPENAI_EMBEDDINGS_MODEL", "text-embedding-3-small")
+        )
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+
+
+# ─── Helper: Get LLM ─────────────────────────────────────────────────────
+
+def _get_llm():
+    """Return the LLM instance based on the configured provider."""
+    llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    if llm_provider == "openai":
+        if ChatOpenAI is None:
+            raise ImportError("LLM_PROVIDER=openai requires 'langchain-openai' to be installed")
+        return ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0")),
+            timeout=float(os.getenv("OPENAI_TIMEOUT", "60")),
+            max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "2")),
+        )
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST")
+    ollama_kwargs = {}
+    if ollama_base_url:
+        ollama_kwargs["base_url"] = ollama_base_url
+    if ChatOllama is not None:
+        return ChatOllama(model=model, num_ctx=num_ctx, **ollama_kwargs)
+    return Ollama(model=model, num_ctx=num_ctx, **ollama_kwargs)
 
 
 # 🧩 Step 1: Load both TXT and PDF legal documents (Constitution, Acts, etc.)
@@ -216,6 +305,141 @@ def build_legal_chain():
     )
 
     print("✅ Legal multilingual chatbot is ready!")
+    return chain
+
+
+# ─── Case Document Analysis ────────────────────────────────────────────────
+
+def analyze_case_document(uploaded_file):
+    """
+    Load an uploaded PDF or TXT file, split it into chunks, build an in-memory
+    FAISS index, and generate a structured case summary using the LLM.
+
+    Parameters
+    ----------
+    uploaded_file : file-like object (BytesIO / Streamlit UploadedFile)
+        The uploaded legal document.
+
+    Returns
+    -------
+    tuple[FAISS, str]
+        (case_faiss_index, case_summary_string)
+
+    Raises
+    ------
+    ValueError
+        If the document is empty or unreadable.
+    """
+    print("📄 Analyzing uploaded case document...")
+
+    # --- Determine file type from name attribute ---
+    file_name = getattr(uploaded_file, "name", "document.pdf")
+    suffix = Path(file_name).suffix.lower()
+
+    # --- Save to temp file (PyPDFLoader needs a path) ---
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.read() if hasattr(uploaded_file, "read") else uploaded_file)
+        tmp_path = tmp.name
+
+    try:
+        # --- Load ---
+        if suffix == ".pdf":
+            loader = PyPDFLoader(tmp_path)
+        else:
+            loader = TextLoader(tmp_path, encoding="utf-8")
+        documents = loader.load()
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    if not documents:
+        raise ValueError("Uploaded document is empty or unreadable.")
+
+    # --- Chunk ---
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    case_chunks = splitter.split_documents(documents)
+    print(f"  ✂️  Split into {len(case_chunks)} chunks.")
+
+    # --- Build in-memory FAISS index ---
+    embeddings = _get_embeddings()
+    case_db = FAISS.from_documents(case_chunks, embeddings)
+    print("  🗂️  In-memory FAISS index created.")
+
+    # --- Generate case summary via LLM ---
+    full_text = "\n".join(doc.page_content for doc in documents)
+    # Truncate to avoid exceeding context window
+    max_chars = int(os.getenv("CASE_SUMMARY_MAX_CHARS", "6000"))
+    truncated_text = full_text[:max_chars]
+    if len(full_text) > max_chars:
+        truncated_text += "\n\n[... document truncated for summary extraction ...]"
+
+    llm = _get_llm()
+    summary_input = CASE_ANALYSIS_PROMPT.format(text=truncated_text)
+    case_summary = llm.predict(summary_input) if hasattr(llm, "predict") else llm.invoke(summary_input)
+    # Handle AIMessage objects
+    if hasattr(case_summary, "content"):
+        case_summary = case_summary.content
+
+    print("  ✅ Case summary generated.")
+    return case_db, case_summary
+
+
+def build_combined_chain(case_db):
+    """
+    Build a ConversationalRetrievalChain that retrieves from BOTH the uploaded
+    case document (case_db) and the persistent legal knowledge base (.faiss_index).
+
+    Uses EnsembleRetriever with Reciprocal Rank Fusion to merge results.
+
+    Parameters
+    ----------
+    case_db : FAISS
+        The in-memory FAISS index built from the uploaded case document.
+
+    Returns
+    -------
+    ConversationalRetrievalChain
+    """
+    print("🔗 Building combined (dual-RAG) retrieval chain...")
+
+    embeddings = _get_embeddings()
+
+    # --- Load existing legal FAISS index ---
+    index_dir = (Path(__file__).resolve().parent / ".faiss_index").resolve()
+    if index_dir.exists():
+        law_db = FAISS.load_local(
+            str(index_dir), embeddings, allow_dangerous_deserialization=True
+        )
+    else:
+        # Rebuild from source documents if index is missing
+        documents = load_legal_docs("data")
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        texts = splitter.split_documents(documents)
+        law_db = FAISS.from_documents(texts, embeddings)
+        law_db.save_local(str(index_dir))
+
+    # --- Create retrievers ---
+    legal_retriever = law_db.as_retriever(search_kwargs={"k": 5})
+    case_retriever = case_db.as_retriever(search_kwargs={"k": 3})
+
+    # --- Ensemble retriever (Reciprocal Rank Fusion) ---
+    combined_retriever = EnsembleRetriever(
+        retrievers=[legal_retriever, case_retriever],
+        weights=[0.5, 0.5],
+    )
+
+    # --- Build chain ---
+    llm = _get_llm()
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=combined_retriever,
+        combine_docs_chain_kwargs={"prompt": COMBINED_QA_PROMPT},
+    )
+
+    print("✅ Combined dual-RAG chain is ready!")
     return chain
 
 

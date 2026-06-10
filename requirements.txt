@@ -2,6 +2,7 @@ langchain
 langchain-community
 langchain-ollama
 langchain-openai
+langchain-text-splitters
 faiss-cpu
 streamlit
 ollama
@@ -11,3 +12,5 @@ fastapi
 uvicorn[standard]
 httpx
 deep-translator
+python-multipart
+rank_bm25

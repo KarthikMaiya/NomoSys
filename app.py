@@ -8,7 +8,7 @@ try:
 except Exception:  # pragma: no cover
     httpx = None
 
-from chatbot_backend import build_legal_chain, translate_answer
+from chatbot_backend import build_legal_chain, translate_answer, analyze_case_document, build_combined_chain
 
 # Initialize chatbot
 st.title("⚖️ NomoSys – AI Legal Chatbot ")
@@ -91,12 +91,23 @@ def call_backend_api(question: str, history: list[tuple[str, str]]) -> str:
         return data.get("answer", "")
 
 
+# ─── Session State Initialization ─────────────────────────────────────
 if "history" not in st.session_state:
     st.session_state.history = []
 
 if "reply_language" not in st.session_state:
     st.session_state.reply_language = "Auto (match my input)"
 
+if "case_summary" not in st.session_state:
+    st.session_state["case_summary"] = None
+
+if "case_db" not in st.session_state:
+    st.session_state["case_db"] = None
+
+if "case_file_name" not in st.session_state:
+    st.session_state["case_file_name"] = None
+
+# ─── Sidebar ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Language")
     st.selectbox(
@@ -107,15 +118,63 @@ with st.sidebar:
     )
     st.caption("Set Auto to reply in the same language you type.")
 
+    st.markdown("---")
+    st.subheader("📄 Document")
+    if st.session_state.get("case_file_name"):
+        st.success(f"Loaded: {st.session_state['case_file_name']}")
+        if st.button("🗑️ Clear Document"):
+            st.session_state["case_db"] = None
+            st.session_state["case_summary"] = None
+            st.session_state["case_file_name"] = None
+            st.rerun()
+    else:
+        st.caption("No document uploaded.")
+
+# ─── Document Upload Section ──────────────────────────────────────────
+with st.expander("📤 Upload a Legal Document for Analysis", expanded=not bool(st.session_state.get("case_summary"))):
+    uploaded_file = st.file_uploader(
+        "Upload a legal document (FIR, judgment, contract, etc.):",
+        type=["pdf", "txt"],
+        key="doc_uploader",
+        help="Supported formats: PDF, TXT. Max size determined by Streamlit config.",
+    )
+    if uploaded_file:
+        if st.button("📋 Analyze Document", type="primary"):
+            with st.spinner("Analyzing document... This may take a minute."):
+                try:
+                    case_db, summary = analyze_case_document(uploaded_file)
+                    st.session_state["case_db"] = case_db
+                    st.session_state["case_summary"] = summary
+                    st.session_state["case_file_name"] = uploaded_file.name
+                    st.success("✅ Document analyzed successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to analyze document: {type(e).__name__}: {e}")
+
+# ─── Case Summary Display ────────────────────────────────────────────
+if st.session_state.get("case_summary"):
+    with st.expander("📄 Case Summary", expanded=True):
+        st.markdown(st.session_state["case_summary"])
+
+# ─── Query Input ─────────────────────────────────────────────────────
 query = st.text_input("Ask a legal question in any supported language:")
 
 if query:
     try:
-        if API_BASE_URL:
+        if st.session_state.get("case_db"):
+            # Dual-RAG: use both case document and legal knowledge base
+            combined_chain = build_combined_chain(st.session_state["case_db"])
+            result = combined_chain.invoke(
+                {"question": query, "chat_history": st.session_state.history}
+            )
+            answer = result["answer"]
+        elif API_BASE_URL:
             answer = call_backend_api(query, st.session_state.history)
         else:
             qa_chain = load_chain()
-            result = qa_chain.invoke({"question": query, "chat_history": st.session_state.history})
+            result = qa_chain.invoke(
+                {"question": query, "chat_history": st.session_state.history}
+            )
             answer = result["answer"]
 
         target_language = resolve_reply_language(query)
@@ -125,17 +184,16 @@ if query:
         st.session_state.history.append((query, answer))
         st.write("**NomoSys:**", answer)
     except Exception as e:
-        if API_BASE_URL:
+        if API_BASE_URL and not st.session_state.get("case_db"):
             prefix = (
                 f"Backend API is unreachable: {API_BASE_URL}. "
                 "If you're using Render free tier, the service may be sleeping; retry after it wakes up.\n\n"
             )
         else:
             prefix = (
-                "LLM backend is not configured for Streamlit Cloud. Set NOMOSYS_API_URL to your FastAPI server URL, "
-                "or set LLM_PROVIDER=openai and OPENAI_API_KEY to run without a separate backend.\n\n"
+                "An error occurred while processing your question. "
+                "Make sure Ollama is running and the model is available.\n\n"
             )
-
         st.error(f"{prefix}Details: {type(e).__name__}: {e}")
 
 # Display chat history
@@ -144,3 +202,10 @@ if st.session_state.history:
     for q, a in st.session_state.history:
         st.markdown(f"**You:** {q}")
         st.markdown(f"**Bot:** {a}")
+
+# ─── Footer ──────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption(
+    "⚠️ **Disclaimer:** NomoSys provides legal *information* only, not legal advice. "
+    "Always verify important legal references independently and consult a qualified legal professional."
+)
