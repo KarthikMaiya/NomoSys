@@ -246,6 +246,42 @@ class TestAnalyzeCaseDocument:
                 mock_llm_fn.return_value = mock_llm
                 analyze_case_document(file_obj)
 
+    def test_analyze_pdf_with_no_extractable_text_raises_clear_error(self):
+        """Image-only PDFs should fail before FAISS receives an empty chunk list."""
+        from chatbot_backend import analyze_case_document
+
+        file_obj = io.BytesIO(b"%PDF-1.4 fake pdf bytes")
+        file_obj.name = "scanned_fir.pdf"
+
+        with patch("chatbot_backend.PyPDFLoader") as mock_loader, \
+             patch("chatbot_backend.FAISS.from_documents") as mock_from_documents:
+            mock_loader.return_value.load.return_value = [
+                Document(page_content="", metadata={"page": 0})
+            ]
+
+            with pytest.raises(ValueError, match="No extractable text"):
+                analyze_case_document(file_obj)
+
+        mock_from_documents.assert_not_called()
+
+    def test_analyze_handles_missing_llm_summary_content(self):
+        """Unexpected empty LLM output should not crash summary handling."""
+        from chatbot_backend import analyze_case_document
+
+        sample_text = "Complainant: Anita Devi\nAccused: Mohan Singh\nIncident: Theft."
+        file_obj = io.BytesIO(sample_text.encode("utf-8"))
+        file_obj.name = "sample_fir.txt"
+
+        with patch("chatbot_backend._get_llm") as mock_llm_fn:
+            mock_llm = MagicMock()
+            mock_llm.predict.return_value = None
+            mock_llm_fn.return_value = mock_llm
+
+            case_db, summary = analyze_case_document(file_obj)
+
+        assert isinstance(case_db, FAISS)
+        assert "could not be generated" in summary
+
 
 # ─── Prompt Template Tests ───────────────────────────────────────────────
 

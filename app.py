@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 
 import streamlit as st
 
@@ -9,6 +10,8 @@ except Exception:  # pragma: no cover
     httpx = None
 
 from chatbot_backend import build_legal_chain, translate_answer, analyze_case_document, build_combined_chain
+
+logger = logging.getLogger(__name__)
 
 # Initialize chatbot
 st.title("⚖️ NomoSys – AI Legal Chatbot ")
@@ -149,6 +152,10 @@ with st.expander("📤 Upload a Legal Document for Analysis", expanded=not bool(
                     st.success("✅ Document analyzed successfully!")
                     st.rerun()
                 except Exception as e:
+                    logger.exception(
+                        "Failed to analyze uploaded document in Streamlit UI: file_name=%s",
+                        getattr(uploaded_file, "name", None),
+                    )
                     st.error(f"Failed to analyze document: {type(e).__name__}: {e}")
 
 # ─── Case Summary Display ────────────────────────────────────────────

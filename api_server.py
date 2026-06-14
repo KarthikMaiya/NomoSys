@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import base64
 import threading
@@ -15,6 +16,8 @@ from chatbot_backend import (
     analyze_case_document,
     build_combined_chain,
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="NomoSys API", version="2.0.0")
 
@@ -102,6 +105,12 @@ def upload_case(file: UploadFile = File(...)):
     content = file.file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    logger.info(
+        "Received upload request: file_name=%s content_type=%s bytes=%d",
+        file.filename,
+        file.content_type,
+        len(content),
+    )
     try:
         file_obj = io.BytesIO(content)
         file_obj.name = file.filename or "document.pdf"
@@ -114,8 +123,10 @@ def upload_case(file: UploadFile = File(...)):
             chunks=case_db.index.ntotal,
         )
     except ValueError as e:
+        logger.warning("Document upload rejected: file_name=%s error=%s", file.filename, e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception("Document upload failed unexpectedly: file_name=%s", file.filename)
         raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
 
 
@@ -156,13 +167,22 @@ def chat(req: ChatRequest) -> ChatResponse:
         if req.file_content:
             try:
                 file_bytes = base64.b64decode(req.file_content)
+                logger.info(
+                    "Processing inline uploaded file: file_name=%s bytes=%d",
+                    req.file_name,
+                    len(file_bytes),
+                )
                 file_obj = io.BytesIO(file_bytes)
                 file_obj.name = req.file_name or "document.pdf"
                 case_db, case_summary = analyze_case_document(file_obj)
                 with _qa_chain_lock:
                     app.state.case_db = case_db
                     app.state.case_summary = case_summary
+            except ValueError as e:
+                logger.warning("Inline file rejected: file_name=%s error=%s", req.file_name, e)
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception:
+                logger.exception("Inline file processing failed: file_name=%s", req.file_name)
                 raise HTTPException(status_code=400, detail="Failed to process inline file")
 
         # Use combined chain if case document is loaded

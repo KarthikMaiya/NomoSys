@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
 import tempfile
@@ -29,14 +30,20 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 try:
     from langchain_core.prompts import PromptTemplate
+    from langchain_core.documents import Document
 except Exception:  # pragma: no cover
     from langchain.prompts import PromptTemplate
+    from langchain.schema import Document
 try:
     from langchain_classic.chains import ConversationalRetrievalChain
 except Exception:  # pragma: no cover
     from langchain.chains import ConversationalRetrievalChain
 
-from langchain.retrievers import EnsembleRetriever
+
+logger = logging.getLogger(__name__)
+
+
+
 
 
 # ─── Prompt Templates for Case Document Analysis ───────────────────────────
@@ -66,15 +73,29 @@ COMBINED_QA_PROMPT = PromptTemplate(
         "2. **Legal Knowledge Context**: Relevant provisions from Indian statutes (Constitution, BNS, CrPC, etc.)\n\n"
         "Both sources are combined in the context below.\n\n"
         "Instructions:\n"
-        "1️⃣ Use the provided context to answer the question factually and accurately.\n"
-        "2️⃣ When the context contains case-specific facts (parties, dates, events), reference them directly.\n"
-        "3️⃣ When the context contains legal provisions, cite the specific article, section, or act by name.\n"
-        "4️⃣ If the question relates to an uploaded case document, connect the case facts to the relevant law.\n"
-        "5️⃣ Prefer Bharatiya Nyaya Sanhita, 2023 (BNS) references over IPC where applicable.\n"
-        "6️⃣ If the answer cannot be determined from the provided context, explicitly state: "
-        "'The provided context does not contain sufficient information to answer this question confidently.'\n"
-        "7️⃣ Do NOT invent or hallucinate any law, section number, or case fact not present in the context.\n"
-        "8️⃣ Be precise, lawful, and formal.\n\n"
+        "Use ONLY Indian law and the provided context. Do NOT invent or hallucinate any law, "
+        "section number, article, case fact, document, party, date, or procedural step not supported by the context.\n"
+        "If the answer cannot be determined from the provided context, explicitly state that the provided context "
+        "does not contain sufficient information to answer confidently.\n"
+        "When context contains case-specific facts, reference them directly. When context contains legal provisions, "
+        "cite the specific Act, Article, or Section by name. Prefer Bharatiya Nyaya Sanhita, 2023 (BNS) references "
+        "over IPC where applicable, but do not guess IPC-to-BNS mappings.\n"
+        "Every answer must follow this exact structure:\n\n"
+        "⚖️ Legal Analysis\n"
+        "Short legal explanation.\n\n"
+        "📋 Action Plan\n\n"
+        "1. Practical next step\n"
+        "2. Practical next step\n"
+        "3. Practical next step\n\n"
+        "📑 Documents Required\n"
+        "• Relevant documents/evidence\n"
+        "• Relevant documents/evidence\n\n"
+        "📚 Relevant Laws\n"
+        "• Relevant Act / Article / Section\n"
+        "• Relevant Act / Article / Section\n\n"
+        "The Action Plan must be practical and user-focused. Documents Required should list useful evidence/documents "
+        "for the issue. If documents are unknown, write: \"Documents depend on the specific facts available.\" "
+        "If laws are unavailable, write: \"No specific law identified from available context.\"\n\n"
         "Context:\n{context}\n\n"
         "Question:\n{question}\n\n"
         "Provide a detailed, well-reasoned answer grounded strictly in the context above."
@@ -276,22 +297,28 @@ def build_legal_chain():
         "You are an advanced constitutional law assistant and legal expert specializing exclusively "
         "in the Constitution of India and Indian laws.\n\n"
         "Instructions:\n"
-        "1️⃣ Use the given context primarily to answer factually and truthfully.\n"
-        "2️⃣ If the question is indirectly related or not explicitly covered in the context, "
-        "apply your deep reasoning and general knowledge of INDIAN LAW to answer accurately.\n"
-        "3️⃣ Always ensure that your answer strictly pertains to Indian legal systems, acts, amendments, "
-        "articles, and judicial practices.\n"
-        "4️⃣ Never discuss or compare with foreign countries or laws unless it helps clarify Indian context.\n"
-        "5️⃣ If absolutely no relevant information is available, respond with:\n"
-        "'The provided context does not contain this information, but under Indian law, it can be interpreted as follows...' "
-        "and then give a reasoned Indian legal explanation if possible.\n"
-        "6️⃣ Be precise, lawful, and formal — avoid speculation or personal opinions.\n"
-        "7️⃣ Penal law references: Prefer Bharatiya Nyaya Sanhita, 2023 (BNS) section references over IPC. "
-        "If the user asks about an IPC section, answer using the corresponding BNS provision when you are confident. "
-        "If you are not confident about the exact IPC→BNS section number mapping, do NOT guess; instead explain that IPC has been replaced by BNS and provide the relevant offence/topic under BNS in a way the user can verify.\n\n"
-        "Important stylistic rule: Do NOT state or imply whether any part of the answer 'comes from' the provided context "
-        "or 'comes from' the assistant's internal knowledge. Present conclusions, reasoning and citations seamlessly — "
-        "do not include meta-statements about source or provenance of individual sentences.\n\n"
+        "Use ONLY Indian law. Use the given context primarily to answer factually and truthfully. "
+        "Do NOT invent or hallucinate any law, section number, article, case fact, document, party, date, or procedural step.\n"
+        "If the available context does not contain sufficient information, explicitly say so. If the question is indirectly "
+        "related to Indian law, provide a careful Indian-law answer only when you can do so without guessing.\n"
+        "Prefer Bharatiya Nyaya Sanhita, 2023 (BNS) references over IPC where applicable, but do not guess IPC-to-BNS mappings. "
+        "Never discuss foreign law unless necessary to clarify Indian legal context.\n"
+        "Every answer must follow this exact structure:\n\n"
+        "⚖️ Legal Analysis\n"
+        "Short legal explanation.\n\n"
+        "📋 Action Plan\n\n"
+        "1. Practical next step\n"
+        "2. Practical next step\n"
+        "3. Practical next step\n\n"
+        "📑 Documents Required\n"
+        "• Relevant documents/evidence\n"
+        "• Relevant documents/evidence\n\n"
+        "📚 Relevant Laws\n"
+        "• Relevant Act / Article / Section\n"
+        "• Relevant Act / Article / Section\n\n"
+        "The Action Plan must be practical and user-focused. Documents Required should list useful evidence/documents "
+        "for the issue. If documents are unknown, write: \"Documents depend on the specific facts available.\" "
+        "If laws are unavailable, write: \"No specific law identified from available context.\"\n\n"
         "Context:\n{context}\n\n"
         "Question:\n{question}\n\n"
         "Now provide a detailed and well-reasoned answer relevant ONLY to Indian law and the Constitution of India."
@@ -309,6 +336,54 @@ def build_legal_chain():
 
 
 # ─── Case Document Analysis ────────────────────────────────────────────────
+
+def _coerce_uploaded_file_bytes(uploaded_file) -> bytes:
+    """Read uploaded bytes without assuming a specific web framework object."""
+    if uploaded_file is None:
+        raise ValueError("No document was uploaded.")
+
+    if isinstance(uploaded_file, bytes):
+        return uploaded_file
+
+    if hasattr(uploaded_file, "seek"):
+        try:
+            uploaded_file.seek(0)
+        except (OSError, ValueError):
+            logger.debug("Uploaded file object could not be rewound before reading.", exc_info=True)
+
+    if hasattr(uploaded_file, "read"):
+        content = uploaded_file.read()
+    else:
+        content = uploaded_file
+
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+
+    if not isinstance(content, (bytes, bytearray)):
+        raise ValueError("Uploaded document could not be read as bytes.")
+
+    content = bytes(content)
+    if not content:
+        raise ValueError("Uploaded document is empty.")
+    return content
+
+
+def _clean_extracted_documents(documents: list[Document]) -> list[Document]:
+    """Keep only pages/chunks with extractable text."""
+    cleaned = []
+    for doc in documents or []:
+        text = (getattr(doc, "page_content", "") or "").strip()
+        if not text:
+            continue
+        doc.page_content = text
+        cleaned.append(doc)
+    return cleaned
+
+
+def _uploaded_file_name(uploaded_file) -> str:
+    file_name = getattr(uploaded_file, "name", None) or getattr(uploaded_file, "filename", None)
+    return Path(file_name or "document.pdf").name
+
 
 def analyze_case_document(uploaded_file):
     """
@@ -333,12 +408,22 @@ def analyze_case_document(uploaded_file):
     print("📄 Analyzing uploaded case document...")
 
     # --- Determine file type from name attribute ---
-    file_name = getattr(uploaded_file, "name", "document.pdf")
+    file_name = _uploaded_file_name(uploaded_file)
     suffix = Path(file_name).suffix.lower()
+    if suffix not in {".pdf", ".txt"}:
+        raise ValueError("Unsupported document type. Please upload a PDF or TXT file.")
+
+    content = _coerce_uploaded_file_bytes(uploaded_file)
+    logger.info(
+        "Starting case document analysis: file_name=%s suffix=%s bytes=%d",
+        file_name,
+        suffix,
+        len(content),
+    )
 
     # --- Save to temp file (PyPDFLoader needs a path) ---
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.read() if hasattr(uploaded_file, "read") else uploaded_file)
+        tmp.write(content)
         tmp_path = tmp.name
 
     try:
@@ -348,6 +433,7 @@ def analyze_case_document(uploaded_file):
         else:
             loader = TextLoader(tmp_path, encoding="utf-8")
         documents = loader.load()
+        logger.info("Loaded uploaded document pages=%d file_name=%s", len(documents), file_name)
     finally:
         # Clean up temp file
         try:
@@ -356,17 +442,58 @@ def analyze_case_document(uploaded_file):
             pass
 
     if not documents:
+        logger.warning("Document loader returned zero pages: file_name=%s", file_name)
         raise ValueError("Uploaded document is empty or unreadable.")
+
+    documents = _clean_extracted_documents(documents)
+    extracted_chars = sum(len(doc.page_content) for doc in documents)
+    logger.info(
+        "Extracted text from uploaded document: text_pages=%d chars=%d file_name=%s",
+        len(documents),
+        extracted_chars,
+        file_name,
+    )
+
+    if not documents or extracted_chars == 0:
+        logger.warning(
+            "No extractable text found in uploaded document: file_name=%s suffix=%s",
+            file_name,
+            suffix,
+        )
+        if suffix == ".pdf":
+            raise ValueError(
+                "No extractable text was found in this PDF. It appears to be scanned or image-only. "
+                "Please upload a text-based PDF/TXT file or run OCR on the PDF first."
+            )
+        raise ValueError("Uploaded document contains no readable text.")
 
     # --- Chunk ---
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    case_chunks = splitter.split_documents(documents)
+    case_chunks = _clean_extracted_documents(splitter.split_documents(documents))
     print(f"  ✂️  Split into {len(case_chunks)} chunks.")
+    logger.info("Chunked uploaded document: chunks=%d file_name=%s", len(case_chunks), file_name)
+
+    if not case_chunks:
+        logger.warning("Text splitter returned zero chunks: file_name=%s", file_name)
+        raise ValueError("Uploaded document text could not be split into searchable chunks.")
 
     # --- Build in-memory FAISS index ---
     embeddings = _get_embeddings()
-    case_db = FAISS.from_documents(case_chunks, embeddings)
+    try:
+        case_db = FAISS.from_documents(case_chunks, embeddings)
+    except IndexError as exc:
+        logger.exception(
+            "FAISS index creation failed because no embeddings were produced: file_name=%s chunks=%d",
+            file_name,
+            len(case_chunks),
+        )
+        raise ValueError("Uploaded document could not be indexed because no text embeddings were produced.") from exc
     print("  🗂️  In-memory FAISS index created.")
+    logger.info(
+        "In-memory FAISS index created: vectors=%s file_name=%s",
+        getattr(getattr(case_db, "index", None), "ntotal", "unknown"),
+        file_name,
+    )
 
     # --- Generate case summary via LLM ---
     full_text = "\n".join(doc.page_content for doc in documents)
@@ -378,70 +505,117 @@ def analyze_case_document(uploaded_file):
 
     llm = _get_llm()
     summary_input = CASE_ANALYSIS_PROMPT.format(text=truncated_text)
-    case_summary = llm.predict(summary_input) if hasattr(llm, "predict") else llm.invoke(summary_input)
+    try:
+        case_summary = llm.predict(summary_input) if hasattr(llm, "predict") else llm.invoke(summary_input)
+    except Exception:
+        logger.exception("Case summary generation failed: file_name=%s", file_name)
+        raise
     # Handle AIMessage objects
     if hasattr(case_summary, "content"):
         case_summary = case_summary.content
+    if isinstance(case_summary, dict):
+        case_summary = case_summary.get("content") or case_summary.get("text") or str(case_summary)
+    if case_summary is None:
+        logger.warning("LLM returned no case summary content: file_name=%s", file_name)
+        case_summary = "Case summary could not be generated from the extracted text."
+    case_summary = str(case_summary).strip()
+    if not case_summary:
+        logger.warning("LLM returned an empty case summary: file_name=%s", file_name)
+        case_summary = "Case summary could not be generated from the extracted text."
 
     print("  ✅ Case summary generated.")
     return case_db, case_summary
 
 
+class CombinedRAGChain(dict):
+    """Small adapter so the manual dual-RAG chain still matches LangChain's invoke API."""
+
+    def invoke(self, inputs):
+        if isinstance(inputs, dict):
+            question = inputs.get("question", "")
+        else:
+            question = str(inputs)
+        answer = ask_combined_question(self, question)
+        return {"answer": answer}
+
+
 def build_combined_chain(case_db):
-    """
-    Build a ConversationalRetrievalChain that retrieves from BOTH the uploaded
-    case document (case_db) and the persistent legal knowledge base (.faiss_index).
-
-    Uses EnsembleRetriever with Reciprocal Rank Fusion to merge results.
-
-    Parameters
-    ----------
-    case_db : FAISS
-        The in-memory FAISS index built from the uploaded case document.
-
-    Returns
-    -------
-    ConversationalRetrievalChain
-    """
-    print("🔗 Building combined (dual-RAG) retrieval chain...")
-
     embeddings = _get_embeddings()
 
-    # --- Load existing legal FAISS index ---
     index_dir = (Path(__file__).resolve().parent / ".faiss_index").resolve()
+
     if index_dir.exists():
         law_db = FAISS.load_local(
-            str(index_dir), embeddings, allow_dangerous_deserialization=True
+            str(index_dir),
+            embeddings,
+            allow_dangerous_deserialization=True
         )
     else:
-        # Rebuild from source documents if index is missing
         documents = load_legal_docs("data")
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=150
+        )
         texts = splitter.split_documents(documents)
+
         law_db = FAISS.from_documents(texts, embeddings)
         law_db.save_local(str(index_dir))
 
-    # --- Create retrievers ---
     legal_retriever = law_db.as_retriever(search_kwargs={"k": 5})
     case_retriever = case_db.as_retriever(search_kwargs={"k": 3})
 
-    # --- Ensemble retriever (Reciprocal Rank Fusion) ---
-    combined_retriever = EnsembleRetriever(
-        retrievers=[legal_retriever, case_retriever],
-        weights=[0.5, 0.5],
+    return CombinedRAGChain({
+        "llm": _get_llm(),
+        "legal_retriever": legal_retriever,
+        "case_retriever": case_retriever,
+    })
+
+def ask_combined_question(chain, question):
+    question = (question or "").strip()
+    if not question:
+        return "Please ask a legal question about the uploaded document."
+
+    try:
+        legal_docs = chain["legal_retriever"].invoke(question)
+    except Exception:
+        logger.exception("Legal retriever failed during combined question.")
+        legal_docs = []
+
+    try:
+        case_docs = chain["case_retriever"].invoke(question)
+    except Exception:
+        logger.exception("Case retriever failed during combined question.")
+        case_docs = []
+
+    all_docs = legal_docs + case_docs
+    if not all_docs:
+        logger.warning("Combined retrievers returned no documents for question.")
+        return "The available context does not contain enough information to answer this question confidently."
+
+    context = "\n\n".join(
+        [(getattr(doc, "page_content", "") or "").strip() for doc in all_docs if (getattr(doc, "page_content", "") or "").strip()]
+    )
+    if not context:
+        logger.warning("Combined retrievers returned documents without text content.")
+        return "The available context does not contain enough readable information to answer this question confidently."
+
+    prompt = COMBINED_QA_PROMPT.format(
+        context=context,
+        question=question
     )
 
-    # --- Build chain ---
-    llm = _get_llm()
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=combined_retriever,
-        combine_docs_chain_kwargs={"prompt": COMBINED_QA_PROMPT},
-    )
+    try:
+        result = chain["llm"].invoke(prompt)
+    except Exception:
+        logger.exception("Combined LLM invocation failed.")
+        raise
 
-    print("✅ Combined dual-RAG chain is ready!")
-    return chain
+    if hasattr(result, "content"):
+        return result.content
+    if isinstance(result, dict):
+        return str(result.get("answer") or result.get("content") or result.get("text") or result)
 
+    return str(result)
 
 # 💬 Step 3: Example of usage
 if __name__ == "__main__":
