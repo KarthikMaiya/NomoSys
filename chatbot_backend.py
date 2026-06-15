@@ -6,7 +6,15 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from pdf2image import convert_from_path
+from dotenv import load_dotenv
+import google.generativeai as genai
 
+load_dotenv()
+
+genai.configure(
+    api_key=os.getenv("GEMINI_API_KEY")
+)
 try:
     from langchain_ollama import ChatOllama  # preferred (newer LangChain)
 except Exception:  # pragma: no cover
@@ -428,12 +436,94 @@ def analyze_case_document(uploaded_file):
 
     try:
         # --- Load ---
+        # --- Load ---
         if suffix == ".pdf":
-            loader = PyPDFLoader(tmp_path)
+
+            print("🤖 Using Gemini Vision for PDF analysis...")
+
+            POPPLER_PATH = os.getenv("POPPLER_PATH")
+
+            pages = convert_from_path(
+                tmp_path,
+                dpi=300,
+                poppler_path=POPPLER_PATH
+            )
+
+            model = genai.GenerativeModel("gemini-2.5-flash")
+
+            prompt = """
+        Analyze this legal document and generate:
+
+        # 📄 Document Overview
+        - Document Type
+        - FIR / Case Number
+        - Police Station / Court
+        - Date of Filing
+
+        # 👥 Parties Involved
+        - Complainant
+        - Victim
+        - Accused
+
+        # ⚖ Applicable Laws
+        List all laws, sections, and acts mentioned.
+
+        # 📌 Key Facts
+        Summarize the incident in bullet points.
+
+        # 📅 Important Dates
+
+        # 📎 Evidence
+
+        # 🔍 Case Strength Assessment
+        Strong / Moderate / Weak
+
+        Explain why.
+
+        # 📋 Recommended Immediate Actions
+
+        # 📁 Required Supporting Documents
+
+        # ⚠ Risk Assessment
+
+        # 📝 Executive Summary
+
+        # ❓ Suggested Questions
+        Generate 10 useful questions a user can ask about this case.
+        """
+
+            extracted_text = ""
+
+            for i, page in enumerate(pages):
+                print(f"Processing page {i+1}/{len(pages)}")
+
+                response = model.generate_content(
+                    [prompt, page]
+                )
+
+                extracted_text += response.text + "\n\n"
+
+            documents = [
+                Document(
+                    page_content=extracted_text,
+                    metadata={"source": file_name}
+                )
+            ]
+
         else:
-            loader = TextLoader(tmp_path, encoding="utf-8")
-        documents = loader.load()
-        logger.info("Loaded uploaded document pages=%d file_name=%s", len(documents), file_name)
+
+            loader = TextLoader(
+                tmp_path,
+                encoding="utf-8"
+            )
+
+            documents = loader.load()
+
+        logger.info(
+            "Loaded uploaded document pages=%d file_name=%s",
+            len(documents),
+            file_name
+        )
     finally:
         # Clean up temp file
         try:
