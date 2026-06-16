@@ -1,231 +1,297 @@
-import os
-import re
+"""NomoSys API Server — v5.0 Demo-Day Edition.
+
+Changes vs v4:
+- /complaint endpoint for complaint letter generation
+- /case returns timeline and legal_insights
+- Chat history is passed through correctly per-request
+- All state management unchanged (per-process singletons)
+"""
+import io
 import logging
+import os
+import threading
+from typing import Any, Dict, List, Optional, Tuple
 
-import streamlit as st
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-try:
-    import httpx
-except Exception:  # pragma: no cover
-    httpx = None
-
-from chatbot_backend import build_legal_chain, translate_answer, analyze_case_document, build_combined_chain
+from chatbot_backend import (
+    build_legal_chain,
+    detect_output_language,
+    translate_answer,
+    analyze_case_document,
+    build_combined_chain,
+    generate_legal_complaint,
+)
 
 logger = logging.getLogger(__name__)
 
-# Initialize chatbot
-st.title("⚖️ NomoSys – AI Legal Chatbot ")
-
-API_BASE_URL = os.getenv("NOMOSYS_API_URL")
-
-SUPPORTED_REPLY_LANGUAGES = {
-    "Auto (match my input)": "auto",
-    "English": "en",
-    "Hindi": "hi",
-    "Telugu": "te",
-    "Tamil": "ta",
-    "Kannada": "kn",
-    "Malayalam": "ml",
-    "Marathi": "mr",
-    "Bengali": "bn",
-    "Gujarati": "gu",
-    "Urdu": "ur",
-    "Arabic": "ar",
-    "Punjabi": "pa",
-}
+app = FastAPI(title="NomoSys API", version="5.0.0")
 
 
-def detect_input_language(query: str) -> str:
-    explicit_match = re.search(r"\bin\s+([A-Za-z]+)\b", query or "", re.IGNORECASE)
-    if explicit_match:
-        explicit_lang = explicit_match.group(1).lower()
-        for label, code in SUPPORTED_REPLY_LANGUAGES.items():
-            if label.lower() == explicit_lang:
-                return code
+# ─── CORS ─────────────────────────────────────────────────────────────────────
 
-    script_patterns = [
-        (r"[\u0900-\u097F]", "hi"),
-        (r"[\u0C00-\u0C7F]", "te"),
-        (r"[\u0B80-\u0BFF]", "ta"),
-        (r"[\u0C80-\u0CFF]", "kn"),
-        (r"[\u0D00-\u0D7F]", "ml"),
-        (r"[\u0980-\u09FF]", "bn"),
-        (r"[\u0A00-\u0A7F]", "pa"),
-        (r"[\u0600-\u06FF]", "ur"),
-        (r"[\u0750-\u077F]", "ar"),
-        (r"[\u0A80-\u0AFF]", "gu"),
-    ]
-    for pattern, language_code in script_patterns:
-        if re.search(pattern, query or ""):
-            return language_code
-
-    return "en"
+def _parse_cors_origins() -> tuple[list[str], bool]:
+    origins_env = os.getenv("CORS_ALLOW_ORIGINS")
+    if origins_env is None:
+        return [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "http://localhost:5175",
+            "http://localhost:5176",
+        ], True
+    origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+    if not origins:
+        return [], True
+    if "*" in origins:
+        return ["*"], False
+    return origins, True
 
 
-def resolve_reply_language(query: str) -> str:
-    selected = st.session_state.get("reply_language", "Auto (match my input)")
-    selected_code = SUPPORTED_REPLY_LANGUAGES.get(selected, "auto")
-    if selected_code != "auto":
-        return selected_code
-    return detect_input_language(query)
-
-
-@st.cache_resource
-def load_chain():
-    chain, law_db = build_legal_chain()
-    return chain, law_db
-
-
-def call_backend_api(question: str, history: list[tuple[str, str]]) -> str:
-    if httpx is None:
-        raise RuntimeError("Missing dependency: httpx")
-
-    if not API_BASE_URL:
-        raise RuntimeError("NOMOSYS_API_URL is not set")
-
-    url = f"{API_BASE_URL.rstrip('/')}/chat"
-    timeout = httpx.Timeout(300.0, connect=10.0)
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(
-            url,
-            json={"question": question, "history": history, "translate": False},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("answer", "")
-
-
-# ─── Session State Initialization ─────────────────────────────────────
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "reply_language" not in st.session_state:
-    st.session_state.reply_language = "Auto (match my input)"
-
-if "case_summary" not in st.session_state:
-    st.session_state["case_summary"] = None
-
-if "case_db" not in st.session_state:
-    st.session_state["case_db"] = None
-
-if "case_file_name" not in st.session_state:
-    st.session_state["case_file_name"] = None
-
-if "combined_chain" not in st.session_state:
-    st.session_state["combined_chain"] = None
-
-# ─── Sidebar ──────────────────────────────────────────────────────────
-with st.sidebar:
-    st.subheader("Language")
-    st.selectbox(
-        "Reply language",
-        list(SUPPORTED_REPLY_LANGUAGES.keys()),
-        key="reply_language",
-        help="Ask in English, Hindi, Telugu, Tamil, Kannada, Malayalam, Marathi, Bengali, Gujarati, Urdu, Arabic, or Punjabi.",
+_cors_origins, _cors_allow_credentials = _parse_cors_origins()
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=_cors_allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
-    st.caption("Set Auto to reply in the same language you type.")
 
-    st.markdown("---")
-    st.subheader("📄 Document")
-    if st.session_state.get("case_file_name"):
-        st.success(f"Loaded: {st.session_state['case_file_name']}")
-        if st.button("🗑️ Clear Document"):
-            st.session_state["case_db"] = None
-            st.session_state["case_summary"] = None
-            st.session_state["case_file_name"] = None
-            st.session_state["combined_chain"] = None
-            st.rerun()
-    else:
-        st.caption("No document uploaded.")
 
-# ─── Document Upload Section ──────────────────────────────────────────
-with st.expander("📤 Upload a Legal Document for Analysis", expanded=not bool(st.session_state.get("case_summary"))):
-    uploaded_file = st.file_uploader(
-        "Upload a legal document (FIR, judgment, contract, etc.):",
-        type=["pdf", "txt"],
-        key="doc_uploader",
-        help="Supported formats: PDF, TXT. Max size determined by Streamlit config.",
+# ─── State Lock ───────────────────────────────────────────────────────────────
+
+_qa_chain_lock = threading.Lock()
+
+
+# ─── Startup ─────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+def _startup() -> None:
+    app.state.qa_chain = None
+    app.state.law_db = None
+    app.state.case_data = None
+    app.state.case_summary = None
+    app.state.combined_chain = None
+
+    def _warmup():
+        try:
+            logger.info("Pre-warming legal chain + embeddings + LLM...")
+            chain, law_db = build_legal_chain()
+            with _qa_chain_lock:
+                app.state.qa_chain = chain
+                app.state.law_db = law_db
+            logger.info("Pre-warm complete. Ready.")
+        except Exception:
+            logger.exception("Pre-warm failed (will lazy-init on first request)")
+
+    threading.Thread(target=_warmup, daemon=True).start()
+
+
+# ─── Models ──────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    history: List[Tuple[str, str]] = Field(
+        default_factory=list,
+        description="List of (user_question, assistant_answer) tuples.",
     )
-    if uploaded_file:
-        if st.button("📋 Analyze Document", type="primary"):
-            with st.spinner("Analyzing document... This may take a minute."):
-                try:
-                    case_db, summary = analyze_case_document(uploaded_file)
-                    st.session_state["case_db"] = case_db
-                    st.session_state["case_summary"] = summary
-                    st.session_state["case_file_name"] = uploaded_file.name
-                    # Build combined chain ONCE at upload time; pass cached law_db
-                    _, law_db = load_chain()
-                    st.session_state["combined_chain"] = build_combined_chain(case_db, law_db=law_db)
-                    st.success("✅ Document analyzed successfully!")
-                    st.rerun()
-                except Exception as e:
-                    logger.exception(
-                        "Failed to analyze uploaded document in Streamlit UI: file_name=%s",
-                        getattr(uploaded_file, "name", None),
-                    )
-                    st.error(f"Failed to analyze document: {type(e).__name__}: {e}")
+    translate: bool = Field(default=True)
 
-# ─── Case Summary Display ────────────────────────────────────────────
-if st.session_state.get("case_summary"):
-    with st.expander("📄 Case Summary", expanded=True):
-        st.markdown(st.session_state["case_summary"])
 
-# ─── Query Input ─────────────────────────────────────────────────────
-query = st.text_input("Ask a legal question in any supported language:")
+class ChatResponse(BaseModel):
+    answer: str
+    target_lang: str
+    case_summary: Optional[str] = Field(default=None)
 
-if query:
+
+class UploadResponse(BaseModel):
+    summary: str
+    status: str = "ok"
+    document_type: Optional[str] = Field(default=None)
+    case_number: Optional[str] = Field(default=None)
+    case_strength: Optional[str] = Field(default=None)
+    timeline: Optional[list] = Field(default=None)
+    legal_insights: Optional[dict] = Field(default=None)
+
+
+class CaseStatusResponse(BaseModel):
+    has_case: bool
+    summary: Optional[str] = None
+    document_type: Optional[str] = None
+    case_number: Optional[str] = None
+    case_strength: Optional[str] = None
+    timeline: Optional[list] = None
+    legal_insights: Optional[dict] = None
+
+
+class ComplaintRequest(BaseModel):
+    complaint_type: str = Field(..., description="e.g. Cyberbullying, Fraud, Harassment")
+    complainant_name: str
+    complainant_address: str
+    incident_description: str
+    incident_date: str = ""
+    accused_name: str = ""
+    additional_details: str = ""
+
+
+class ComplaintResponse(BaseModel):
+    letter: str
+    status: str = "ok"
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {
+        "status": "ok",
+        "model_ready": getattr(app.state, "qa_chain", None) is not None,
+        "case_loaded": getattr(app.state, "case_data", None) is not None,
+        "version": "5.0.0",
+    }
+
+
+@app.post("/upload", response_model=UploadResponse)
+def upload_case(file: UploadFile = File(...)):
+    """Upload a case document (PDF/TXT). Returns structured summary from Gemini."""
+    content = file.file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    logger.info("Upload: file=%s content_type=%s bytes=%d",
+                file.filename, file.content_type, len(content))
+
     try:
-        if st.session_state.get("case_db"):
-            # Use CACHED combined chain (built once at upload time)
-            combined_chain = st.session_state.get("combined_chain")
-            if combined_chain is None:
-                # Fallback: rebuild if somehow missing (e.g. page reload)
-                _, law_db = load_chain()
-                combined_chain = build_combined_chain(st.session_state["case_db"], law_db=law_db)
-                st.session_state["combined_chain"] = combined_chain
-            result = combined_chain.invoke(
-                {"question": query, "chat_history": st.session_state.history}
-            )
-            answer = result["answer"]
-        elif API_BASE_URL:
-            answer = call_backend_api(query, st.session_state.history)
-        else:
-            qa_chain, _ = load_chain()
-            result = qa_chain.invoke(
-                {"question": query, "chat_history": st.session_state.history}
-            )
-            answer = result["answer"]
+        file_obj = io.BytesIO(content)
+        file_obj.name = file.filename or "document.pdf"
 
-        target_language = resolve_reply_language(query)
-        if target_language != "en":
-            answer = translate_answer(answer, target_language)
+        case_data, summary = analyze_case_document(file_obj)
 
-        st.session_state.history.append((query, answer))
-        st.write("**NomoSys:**", answer)
+        law_db = getattr(app.state, "law_db", None)
+        combined_chain = build_combined_chain(case_data, law_db=law_db)
+
+        with _qa_chain_lock:
+            app.state.case_data = case_data
+            app.state.case_summary = summary
+            app.state.combined_chain = combined_chain
+
+        strength = None
+        if isinstance(case_data.get("case_strength"), dict):
+            strength = case_data["case_strength"].get("rating")
+
+        from chatbot_backend import _extract_case_timeline
+        timeline = _extract_case_timeline(case_data)
+
+        return UploadResponse(
+            summary=summary,
+            document_type=case_data.get("document_type"),
+            case_number=case_data.get("case_number"),
+            case_strength=strength,
+            timeline=timeline or None,
+            legal_insights=case_data.get("legal_insights") or None,
+        )
+    except ValueError as e:
+        logger.warning("Upload rejected: file=%s error=%s", file.filename, e)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        if API_BASE_URL and not st.session_state.get("case_db"):
-            prefix = (
-                f"Backend API is unreachable: {API_BASE_URL}. "
-                "If you're using Render free tier, the service may be sleeping; retry after it wakes up.\n\n"
-            )
+        logger.exception("Upload failed: file=%s", file.filename)
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+
+
+@app.delete("/case")
+def clear_case():
+    with _qa_chain_lock:
+        app.state.case_data = None
+        app.state.case_summary = None
+        app.state.combined_chain = None
+    return {"status": "cleared"}
+
+
+@app.get("/case", response_model=CaseStatusResponse)
+def get_case_status():
+    case_data = getattr(app.state, "case_data", None)
+    if case_data is None:
+        return CaseStatusResponse(has_case=False)
+
+    strength = None
+    if isinstance(case_data.get("case_strength"), dict):
+        strength = case_data["case_strength"].get("rating")
+
+    from chatbot_backend import _extract_case_timeline
+    timeline = _extract_case_timeline(case_data)
+
+    return CaseStatusResponse(
+        has_case=True,
+        summary=getattr(app.state, "case_summary", None),
+        document_type=case_data.get("document_type"),
+        case_number=case_data.get("case_number"),
+        case_strength=strength,
+        timeline=timeline or None,
+        legal_insights=case_data.get("legal_insights") or None,
+    )
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest) -> ChatResponse:
+    qa_chain = getattr(app.state, "qa_chain", None)
+    if qa_chain is None:
+        with _qa_chain_lock:
+            qa_chain = getattr(app.state, "qa_chain", None)
+            if qa_chain is None:
+                try:
+                    chain, law_db = build_legal_chain()
+                    app.state.qa_chain = chain
+                    app.state.law_db = law_db
+                    qa_chain = chain
+                except Exception:
+                    raise HTTPException(status_code=503, detail="Model failed to initialize")
+    else:
+        logger.info("CHAIN REUSED")
+
+    try:
+        combined_chain = getattr(app.state, "combined_chain", None)
+        if combined_chain is not None:
+            result = combined_chain.invoke({"question": req.question, "chat_history": req.history})
         else:
-            prefix = (
-                "An error occurred while processing your question. "
-                "Make sure Ollama is running and the model is available.\n\n"
-            )
-        st.error(f"{prefix}Details: {type(e).__name__}: {e}")
+            result = qa_chain.invoke({"question": req.question, "chat_history": req.history})
 
-# Display chat history
-if st.session_state.history:
-    st.markdown("### Chat History")
-    for q, a in st.session_state.history:
-        st.markdown(f"**You:** {q}")
-        st.markdown(f"**Bot:** {a}")
+        answer = result.get("answer", "")
 
-# ─── Footer ──────────────────────────────────────────────────────────
-st.markdown("---")
-st.caption(
-    "⚠️ **Disclaimer:** NomoSys provides legal *information* only, not legal advice. "
-    "Always verify important legal references independently and consult a qualified legal professional."
-)
+        target_lang = "en"
+        if req.translate:
+            target_lang = detect_output_language(req.question)
+            if target_lang != "en":
+                answer = translate_answer(answer, target_lang)
+
+        return ChatResponse(
+            answer=answer,
+            target_lang=target_lang,
+            case_summary=getattr(app.state, "case_summary", None),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Chat error")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/complaint", response_model=ComplaintResponse)
+def generate_complaint(req: ComplaintRequest) -> ComplaintResponse:
+    """Generate a formal Indian legal complaint letter."""
+    try:
+        letter = generate_legal_complaint(
+            complaint_type=req.complaint_type,
+            complainant_name=req.complainant_name,
+            complainant_address=req.complainant_address,
+            incident_description=req.incident_description,
+            incident_date=req.incident_date,
+            accused_name=req.accused_name,
+            additional_details=req.additional_details,
+        )
+        return ComplaintResponse(letter=letter)
+    except Exception as e:
+        logger.exception("Complaint generation failed")
+        raise HTTPException(status_code=500, detail=f"Complaint generation failed: {e}")
