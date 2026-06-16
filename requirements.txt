@@ -13,5 +13,4 @@ uvicorn[standard]
 httpx
 deep-translator
 python-multipart
-rank_bm25
 google-generativeai

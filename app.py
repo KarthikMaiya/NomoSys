@@ -72,7 +72,8 @@ def resolve_reply_language(query: str) -> str:
 
 @st.cache_resource
 def load_chain():
-    return build_legal_chain()
+    chain, law_db = build_legal_chain()
+    return chain, law_db
 
 
 def call_backend_api(question: str, history: list[tuple[str, str]]) -> str:
@@ -110,6 +111,9 @@ if "case_db" not in st.session_state:
 if "case_file_name" not in st.session_state:
     st.session_state["case_file_name"] = None
 
+if "combined_chain" not in st.session_state:
+    st.session_state["combined_chain"] = None
+
 # ─── Sidebar ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Language")
@@ -129,6 +133,7 @@ with st.sidebar:
             st.session_state["case_db"] = None
             st.session_state["case_summary"] = None
             st.session_state["case_file_name"] = None
+            st.session_state["combined_chain"] = None
             st.rerun()
     else:
         st.caption("No document uploaded.")
@@ -149,6 +154,9 @@ with st.expander("📤 Upload a Legal Document for Analysis", expanded=not bool(
                     st.session_state["case_db"] = case_db
                     st.session_state["case_summary"] = summary
                     st.session_state["case_file_name"] = uploaded_file.name
+                    # Build combined chain ONCE at upload time; pass cached law_db
+                    _, law_db = load_chain()
+                    st.session_state["combined_chain"] = build_combined_chain(case_db, law_db=law_db)
                     st.success("✅ Document analyzed successfully!")
                     st.rerun()
                 except Exception as e:
@@ -169,8 +177,13 @@ query = st.text_input("Ask a legal question in any supported language:")
 if query:
     try:
         if st.session_state.get("case_db"):
-            # Dual-RAG: use both case document and legal knowledge base
-            combined_chain = build_combined_chain(st.session_state["case_db"])
+            # Use CACHED combined chain (built once at upload time)
+            combined_chain = st.session_state.get("combined_chain")
+            if combined_chain is None:
+                # Fallback: rebuild if somehow missing (e.g. page reload)
+                _, law_db = load_chain()
+                combined_chain = build_combined_chain(st.session_state["case_db"], law_db=law_db)
+                st.session_state["combined_chain"] = combined_chain
             result = combined_chain.invoke(
                 {"question": query, "chat_history": st.session_state.history}
             )
@@ -178,7 +191,7 @@ if query:
         elif API_BASE_URL:
             answer = call_backend_api(query, st.session_state.history)
         else:
-            qa_chain = load_chain()
+            qa_chain, _ = load_chain()
             result = qa_chain.invoke(
                 {"question": query, "chat_history": st.session_state.history}
             )

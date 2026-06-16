@@ -1,7 +1,15 @@
+"""NomoSys API Server — Optimized for speed.
+
+Key optimizations vs. original:
+- Pre-warm legal chain + embeddings + LLM in background thread at startup
+- Combined chain built ONCE at upload, cached in app.state (not per-message)
+- law_db cached from build_legal_chain(), passed to build_combined_chain()
+- Inline file upload in /chat removed (dead code, duplicates /upload)
+- file_name / file_content fields removed from ChatRequest (dead)
+"""
 import io
 import logging
 import os
-import base64
 import threading
 from typing import List, Optional, Tuple
 
@@ -19,13 +27,21 @@ from chatbot_backend import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="NomoSys API", version="2.0.0")
+app = FastAPI(title="NomoSys API", version="3.0.0")
 
+
+# ─── CORS ─────────────────────────────────────────────────────────────────
 
 def _parse_cors_origins() -> tuple[list[str], bool]:
     origins_env = os.getenv("CORS_ALLOW_ORIGINS")
     if origins_env is None:
-        return ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:5176"], True
+        return [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "http://localhost:5175",
+            "http://localhost:5176",
+        ], True
     origins = [o.strip() for o in origins_env.split(",") if o.strip()]
     if not origins:
         return [], True
@@ -45,15 +61,36 @@ if _cors_origins:
     )
 
 
+# ─── State Lock ───────────────────────────────────────────────────────────
+
 _qa_chain_lock = threading.Lock()
 
+
+# ─── Startup: Pre-warm everything in background ──────────────────────────
 
 @app.on_event("startup")
 def _startup() -> None:
     app.state.qa_chain = None
+    app.state.law_db = None       # Cached law FAISS index
     app.state.case_db = None
     app.state.case_summary = None
+    app.state.combined_chain = None  # Cached combined chain
 
+    def _warmup():
+        try:
+            logger.info("Pre-warming legal chain...")
+            chain, law_db = build_legal_chain()
+            with _qa_chain_lock:
+                app.state.qa_chain = chain
+                app.state.law_db = law_db
+            logger.info("Legal chain pre-warmed successfully")
+        except Exception:
+            logger.exception("Failed to pre-warm legal chain (will lazy-init on first request)")
+
+    threading.Thread(target=_warmup, daemon=True).start()
+
+
+# ─── Models ───────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
@@ -64,14 +101,6 @@ class ChatRequest(BaseModel):
     translate: bool = Field(
         default=True,
         description="If true, detects 'in Hindi/Telugu/...' in the question and translates the answer.",
-    )
-    file_name: Optional[str] = Field(
-        default=None,
-        description="Name of uploaded case file (for type detection)",
-    )
-    file_content: Optional[str] = Field(
-        default=None,
-        description="Base64-encoded file content for inline upload",
     )
 
 
@@ -90,6 +119,8 @@ class UploadResponse(BaseModel):
     chunks: int = Field(description="Number of document chunks created")
 
 
+# ─── Endpoints ────────────────────────────────────────────────────────────
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {
@@ -101,41 +132,52 @@ def healthz() -> dict:
 
 @app.post("/upload", response_model=UploadResponse)
 def upload_case(file: UploadFile = File(...)):
-    """Upload a case document (PDF/TXT) for analysis. Returns a structured case summary."""
+    """Upload a case document (PDF/TXT). Returns structured summary.
+
+    Builds combined chain at upload time and caches it.
+    """
     content = file.file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
     logger.info(
-        "Received upload request: file_name=%s content_type=%s bytes=%d",
-        file.filename,
-        file.content_type,
-        len(content),
+        "Upload: file=%s content_type=%s bytes=%d",
+        file.filename, file.content_type, len(content),
     )
+
     try:
         file_obj = io.BytesIO(content)
         file_obj.name = file.filename or "document.pdf"
         case_db, summary = analyze_case_document(file_obj)
+
+        # Build combined chain NOW (not per-message). Pass cached law_db.
+        law_db = getattr(app.state, "law_db", None)
+        combined_chain = build_combined_chain(case_db, law_db=law_db)
+
         with _qa_chain_lock:
             app.state.case_db = case_db
             app.state.case_summary = summary
+            app.state.combined_chain = combined_chain
+
         return UploadResponse(
             summary=summary,
             chunks=case_db.index.ntotal,
         )
     except ValueError as e:
-        logger.warning("Document upload rejected: file_name=%s error=%s", file.filename, e)
+        logger.warning("Upload rejected: file=%s error=%s", file.filename, e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("Document upload failed unexpectedly: file_name=%s", file.filename)
+        logger.exception("Upload failed: file=%s", file.filename)
         raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
 
 
 @app.delete("/case")
 def clear_case():
-    """Clear the uploaded case document and its FAISS index."""
+    """Clear the uploaded case document and its cached chain."""
     with _qa_chain_lock:
         app.state.case_db = None
         app.state.case_summary = None
+        app.state.combined_chain = None
     return {"status": "cleared"}
 
 
@@ -151,48 +193,25 @@ def get_case_status():
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
+    # Ensure legal chain is ready (pre-warmed at startup, lazy fallback)
     qa_chain = getattr(app.state, "qa_chain", None)
     if qa_chain is None:
         with _qa_chain_lock:
             qa_chain = getattr(app.state, "qa_chain", None)
             if qa_chain is None:
                 try:
-                    qa_chain = build_legal_chain()
-                    app.state.qa_chain = qa_chain
+                    chain, law_db = build_legal_chain()
+                    app.state.qa_chain = chain
+                    app.state.law_db = law_db
+                    qa_chain = chain
                 except Exception:
                     raise HTTPException(status_code=503, detail="Model failed to initialize")
 
     try:
-        # Handle inline file upload
-        if req.file_content:
-            try:
-                file_bytes = base64.b64decode(req.file_content)
-                logger.info(
-                    "Processing inline uploaded file: file_name=%s bytes=%d",
-                    req.file_name,
-                    len(file_bytes),
-                )
-                file_obj = io.BytesIO(file_bytes)
-                file_obj.name = req.file_name or "document.pdf"
-                case_db, case_summary = analyze_case_document(file_obj)
-                with _qa_chain_lock:
-                    app.state.case_db = case_db
-                    app.state.case_summary = case_summary
-            except ValueError as e:
-                logger.warning("Inline file rejected: file_name=%s error=%s", req.file_name, e)
-                raise HTTPException(status_code=400, detail=str(e))
-            except Exception:
-                logger.exception("Inline file processing failed: file_name=%s", req.file_name)
-                raise HTTPException(status_code=400, detail="Failed to process inline file")
-
-        # Use combined chain if case document is loaded
-        case_db = getattr(app.state, "case_db", None)
-        if case_db is not None:
-            try:
-                chain = build_combined_chain(case_db)
-                result = chain.invoke({"question": req.question, "chat_history": req.history})
-            except Exception:
-                raise HTTPException(status_code=500, detail="Combined chain error")
+        # Use CACHED combined chain if case is loaded (not rebuilt per-message)
+        combined_chain = getattr(app.state, "combined_chain", None)
+        if combined_chain is not None:
+            result = combined_chain.invoke({"question": req.question, "chat_history": req.history})
         else:
             result = qa_chain.invoke({"question": req.question, "chat_history": req.history})
 
@@ -212,4 +231,5 @@ def chat(req: ChatRequest) -> ChatResponse:
     except HTTPException:
         raise
     except Exception:
+        logger.exception("Chat error")
         raise HTTPException(status_code=500, detail="Internal server error")
