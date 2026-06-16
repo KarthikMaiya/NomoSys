@@ -4,26 +4,32 @@
   width: 100vw;
   overflow: hidden;
   position: relative;
+  background-color: var(--color-bg-primary);
 }
 
+/* CRITICAL FIX: main-content must be transparent so the Lady Justice
+   watermark (z-index: 1) shows through behind the chat content.
+   The previous linear-gradient at 0.95-0.98 opacity was completely
+   hiding the watermark. */
 .main-content {
   flex: 1;
   display: flex;
   flex-direction: column;
   position: relative;
-  z-index: 1;
-  background: linear-gradient(135deg, rgba(11, 15, 25, 0.95), rgba(15, 23, 42, 0.98));
+  z-index: 2;
+  background: transparent;
 }
 
 /* Sidebar Styles */
 .sidebar {
   width: 280px;
+  min-width: 280px;
   background-color: var(--color-bg-primary);
   border-right: 1px solid var(--color-border);
   display: flex;
   flex-direction: column;
   padding: 1.5rem;
-  z-index: 2;
+  z-index: 3;
 }
 
 .brand-section {
@@ -81,10 +87,15 @@
   appearance: none;
 }
 
+.language-select option {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+
 .history-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
   flex: 1;
   overflow-y: auto;
 }
@@ -97,6 +108,7 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  border: 1px solid transparent;
 }
 
 .history-item:hover {
@@ -105,21 +117,22 @@
 
 .history-item.active {
   background-color: rgba(212, 175, 55, 0.1);
-  border: 1px solid rgba(212, 175, 55, 0.2);
+  border-color: rgba(212, 175, 55, 0.2);
 }
 
 .history-item-title {
-  font-size: 0.9rem;
+  font-size: 0.85rem;
   color: var(--color-text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 160px;
+  max-width: 150px;
 }
 
 .history-item-time {
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   color: var(--color-text-muted);
+  flex-shrink: 0;
 }
 
 .privacy-card {
@@ -146,7 +159,6 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  scroll-behavior: smooth;
 }
 
 .chat-content-width {
@@ -160,6 +172,12 @@
 .message-row {
   display: flex;
   width: 100%;
+  animation: fadeIn 0.3s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .message-row.user {
@@ -225,6 +243,9 @@
 .markdown-content li {
   margin-bottom: 0.5rem;
 }
+.markdown-content strong {
+  color: var(--color-accent-gold);
+}
 
 /* Document Card Styles */
 .document-card {
@@ -255,10 +276,12 @@
 
 /* Input Area Styles */
 .input-area-container {
-  padding: 1.5rem 2rem 2.5rem;
+  padding: 1rem 2rem 2rem;
   display: flex;
   justify-content: center;
-  background: linear-gradient(to top, var(--color-bg-primary) 50%, transparent);
+  background: linear-gradient(to top, var(--color-bg-primary) 60%, transparent);
+  position: relative;
+  z-index: 2;
 }
 
 .input-box {
@@ -305,6 +328,7 @@
   padding: 0.75rem 1rem;
   color: var(--color-text-primary);
   font-size: 1rem;
+  font-family: var(--font-sans);
   outline: none;
 }
 
@@ -336,24 +360,28 @@
   opacity: 0.5;
 }
 
-.loader {
-  display: inline-block;
-  width: 20px;
-  height: 20px;
-  border: 2px solid rgba(0, 0, 0, 0.2);
-  border-radius: 50%;
-  border-top-color: #000;
-  animation: spin 1s ease-in-out infinite;
+/* ─── Rich Loading Indicator ────────────────────────────────────────── */
+.loading-bubble {
+  min-width: 220px;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
+.loading-phase-text {
+  font-size: 0.85rem;
+  color: var(--color-accent-gold);
+  font-weight: 500;
+  margin-bottom: 0.25rem;
+  animation: phasePulse 2s ease-in-out infinite;
+}
+
+@keyframes phasePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
 }
 
 .typing-indicator {
   display: flex;
-  gap: 4px;
-  padding: 1rem;
+  gap: 5px;
+  padding: 0.5rem 0 0.25rem;
   align-items: center;
 }
 

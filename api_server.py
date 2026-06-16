@@ -25,7 +25,7 @@ app = FastAPI(title="NomoSys API", version="2.0.0")
 def _parse_cors_origins() -> tuple[list[str], bool]:
     origins_env = os.getenv("CORS_ALLOW_ORIGINS")
     if origins_env is None:
-        return ["http://localhost:3000", "http://localhost:5173"], True
+        return ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:5176"], True
     origins = [o.strip() for o in origins_env.split(",") if o.strip()]
     if not origins:
         return [], True
